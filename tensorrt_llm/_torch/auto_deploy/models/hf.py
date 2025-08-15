@@ -310,6 +310,9 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _load_checkpoint_old(self, model: nn.Module, device: DeviceLikeType):
         """Load the checkpoint into the model."""
+        # identify the most relevant checkpoint file
+        ckpt_file = self._get_checkpoint_file(self.model)
+        # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
             # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
             # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
@@ -317,7 +320,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
             # model.load_state_dict.
             # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
             # model-transformed weights,leading to unexpected key mismatches or format issues.
-            load_checkpoint_in_model(model, checkpoint=state_dict, full_state_dict=False)
+            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
 
     def _load_checkpoint(self, model, device):
         index_json_path = self._get_checkpoint_file(self.model)
