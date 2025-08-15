@@ -97,7 +97,7 @@ def _pixtral_forward(
             patch_embeds,
         )
 
-    return self.transformer(
+    out = self.transformer(
         patch_embeds,
         attention_mask=attention_mask,
         position_embeddings=position_embeddings,
@@ -106,12 +106,14 @@ def _pixtral_forward(
         return_dict=True,
         **kwargs,
     )
+    return out
 
 
 def generate_block_attention_mask(num_ids_per_image, tensor):
     dtype = tensor.dtype
     device = tensor.device
     seq_len = tensor.shape[1]
+    d_min = torch.finfo(dtype).min
 
     idx = torch.arange(seq_len, device=device)
     block_end_idx = num_ids_per_image.cumsum(-1)
@@ -122,8 +124,8 @@ def generate_block_attention_mask(num_ids_per_image, tensor):
         ]
     ).cumsum(-1)
 
-    # Build a mask where positions outside each [start, end) block are 1, inside are 0.
-    mask = torch.ones((seq_len, seq_len), device=device, dtype=dtype)
+    # Build a mask where positions outside each [start, end) block are d_min, inside are 0.
+    mask = torch.full((seq_len, seq_len), fill_value=d_min, device=device, dtype=dtype)
     for start, end in zip(block_start_idx, block_end_idx):
         block = (idx >= start) & (idx < end)
         mask[block.unsqueeze(0) & block.unsqueeze(1)] = 0
