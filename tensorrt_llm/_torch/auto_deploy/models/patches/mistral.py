@@ -123,7 +123,7 @@ def _mistral_forward(
         return inputs_embeds
 
     # Decide by whether there is any non-zero pixel_values.
-    has_image: torch.Tensor = torch.any(pixel_values != 0)
+    has_image: torch.Tensor = (pixel_values is not None) and torch.any(pixel_values != 0)
 
     inputs_embeds = torch.cond(
         has_image,

@@ -253,7 +253,10 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
         outs = [outs]
     for i, out in enumerate(outs):
         prompt, output = out.prompt, out.outputs[0].text
+        finish_reason = out.outputs[0].finish_reason
+        num_tokens = len(out.outputs[0].token_ids)
         ad_logger.info(f"[PROMPT {i}] {prompt}: {output}")
+        print(f"====== {finish_reason=} {num_tokens=}")
         prompts_and_outputs.append([prompt, output])
     return prompts_and_outputs
 
