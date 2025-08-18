@@ -119,6 +119,11 @@ class DemoEngine(ADEngine):
         # setup objects we want to track for the output
         batch_size = sequence_info.num_sequences
         new_tokens = [[] for _ in range(batch_size)]  # [batch_size][max_seq_len]
+        # HACK.
+        if not sampling_params.stop_token_ids:
+            sampling_params.stop_token_ids = []
+        if sampling_params.end_id is not None:
+            sampling_params.stop_token_ids.append(sampling_params.end_id)
         stop_tokens = sampling_params._get_stop_words()
         idxs_stop = [sampling_params.max_tokens - 1] * batch_size
         gen_logits = [] if sampling_params.return_generation_logits else None
