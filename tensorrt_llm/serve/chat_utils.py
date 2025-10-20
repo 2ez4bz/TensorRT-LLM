@@ -2,12 +2,14 @@ from functools import partial
 from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
                     Optional, Tuple, TypeAlias, TypedDict, Union, cast)
 
-from openai.types.chat import (ChatCompletionContentPartImageParam,
+from openai.types.chat import (ChatCompletionAssistantMessageParam,
+                               ChatCompletionContentPartImageParam,
                                ChatCompletionContentPartInputAudioParam)
 from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import (ChatCompletionContentPartTextParam,
-                               ChatCompletionMessageParam)
+                               ChatCompletionMessageParam,
+                               ChatCompletionToolMessageParam)
 from transformers import AutoConfig
 from typing_extensions import Required
 
@@ -169,6 +171,30 @@ def parse_chat_message_content(
         role,
         content,
     )
+    if role == "assistant":
+        result.update(**_parse_assistant_message_content(message))
+    elif role == "tool":
+        result.update(**_parse_tool_message_content(message))
+    return result
+
+
+def _parse_assistant_message_content(
+        message: ChatCompletionAssistantMessageParam) -> Dict[str, Any]:
+    # NOTE: `ChatCompletionAssistantMessageParam` is a dict (TypedDict).
+    result = {}
+    tool_calls = message.get("tool_calls")
+    if tool_calls is not None:
+        result["tool_calls"] = list(tool_calls)
+
+    return result
+
+
+def _parse_tool_message_content(
+        message: ChatCompletionToolMessageParam) -> Dict[str, Any]:
+    # NOTE: `ChatCompletionToolMessageParam` is a dict (TypedDict).
+    result = {}
+    if "tool_call_id" in result:
+        result["tool_call_id"] = message["tool_call_id"]
     return result
 
 

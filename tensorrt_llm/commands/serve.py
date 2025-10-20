@@ -143,7 +143,9 @@ def launch_server(host: str,
                   llm_args: dict,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
                   server_role: Optional[ServerRole] = None,
-                  disagg_cluster_config: Optional[DisaggClusterConfig] = None):
+                  disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+                  enable_auto_tool_choice: bool = False,
+                  tool_call_parser: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
@@ -161,11 +163,15 @@ def launch_server(host: str,
             f"{backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
-    server = OpenAIServer(llm=llm,
-                          model=model,
-                          server_role=server_role,
-                          metadata_server_cfg=metadata_server_cfg,
-                          disagg_cluster_config=disagg_cluster_config)
+    server = OpenAIServer(
+        llm=llm,
+        model=model,
+        server_role=server_role,
+        metadata_server_cfg=metadata_server_cfg,
+        disagg_cluster_config=disagg_cluster_config,
+        enable_auto_tool_choice=enable_auto_tool_choice,
+        tool_call_parser=tool_call_parser,
+    )
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -325,6 +331,24 @@ class ChoiceWithAlias(click.Choice):
               is_flag=True,
               default=False,
               help="Enable chunked prefill")
+@click.option(
+    "--enable_auto_tool_choice",
+    is_flag=True,
+    default=False,
+    help=
+    "Enable automatic tool calling detection when tool_choice='auto' is specified in requests. "
+    "Requires --tool_call_parser to be set.")
+@click.option(
+    "--tool_call_parser",
+    type=str,
+    default=None,
+    help=
+    "Name of the tool parser to use for extracting tool calls from model outputs. "
+    "Available parsers must be registered via ToolParserManager. "
+    "Common parsers can be copied from vLLM (e.g., 'hermes', 'mistral', 'granite')."
+)
+# TODO: add `--tool_parser_plugin` to enable custom implementations.
+# TODO: add `exclude_tools_when_tool_choice_none`?
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -335,7 +359,8 @@ def serve(
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str]):
+        enable_chunked_prefill: bool, disagg_cluster_uri: Optional[str],
+        enable_auto_tool_choice: bool, tool_call_parser: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -391,8 +416,21 @@ def serve(
         except ValueError:
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+
+    # Validate tool parser configuration
+    if enable_auto_tool_choice and not tool_call_parser:
+        raise click.BadParameter(
+            "--tool_call_parser must be specified when --enable_auto_tool_choice is set",
+            param_hint="--tool_call_parser")
+    if tool_call_parser and not enable_auto_tool_choice:
+        logger.warning(
+            "--tool_call_parser is specified but --enable_auto_tool_choice is not set. "
+            "Tool parsing will not be active for tool_choice='auto'. "
+            "Set --enable_auto_tool_choice to enable automatic tool detection.")
+
     launch_server(host, port, llm_args, metadata_server_cfg, server_role,
-                  disagg_cluster_config)
+                  disagg_cluster_config, enable_auto_tool_choice,
+                  tool_call_parser)
 
 
 @click.command("mm_embedding_serve")

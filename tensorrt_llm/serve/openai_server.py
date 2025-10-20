@@ -79,7 +79,9 @@ class OpenAIServer:
                  model: str,
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig,
-                 disagg_cluster_config: Optional[DisaggClusterConfig] = None):
+                 disagg_cluster_config: Optional[DisaggClusterConfig] = None,
+                 enable_auto_tool_choice: bool = False,
+                 tool_call_parser: Optional[str] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
@@ -141,6 +143,23 @@ class OpenAIServer:
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
 
+        # Tool call parser configuration.
+        self._enable_auto_tool_choice = enable_auto_tool_choice
+        self._tool_call_parser_name = tool_call_parser
+        self._tool_call_parser_cls = None
+
+        if tool_call_parser:
+            from tensorrt_llm.serve.tool_parsers import ToolParserManager
+            try:
+                self._tool_call_parser_cls = ToolParserManager.get_tool_call_parser(tool_call_parser)
+                logger.info(f"Loaded tool parser: {tool_call_parser}.")
+            except KeyError:
+                logger.warning(
+                    f"Tool parser '{tool_call_parser}' not found. "
+                    "Tool parsing will be disabled. Available parsers: "
+                    f"{list(ToolParserManager._parsers.keys())}."
+                )
+
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             if self.metadata_server is not None:
@@ -174,8 +193,18 @@ class OpenAIServer:
         self.app = FastAPI(lifespan=lifespan)
 
         @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(_, exc):
+        async def validation_exception_handler(request: Request, exc: RequestValidationError):
+            await _log_request_error(request, exc, "Request Validation Error")
             return self.create_error_response(message=str(exc))
+
+        @self.app.exception_handler(Exception)
+        async def general_exception_handler(request: Request, exc: Exception):
+            await _log_request_error(request, exc, "Unhandled Exception")
+            return self.create_error_response(
+                message=str(exc),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
 
         if self.server_role is not ServerRole.MM_ENCODER:
             self.register_routes()
@@ -462,10 +491,18 @@ class OpenAIServer:
                 promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
             await promise.aresult()
             if self.postproc_worker_enabled:
-                chat_response =promise.outputs[0]._postprocess_result
+                chat_response = promise.outputs[0]._postprocess_result
             else:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 chat_response = post_processor(promise, args)
+
+            choices = self._process_choices_for_tool_calls(
+                role=get_role(),
+                request=request,
+                # FIXME / TODO: Figure out if we should be using `promise` vs `chat_response`...
+                request_output=promise,
+            )
+            chat_response.choices = choices
 
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
@@ -475,6 +512,7 @@ class OpenAIServer:
             return chat_response
 
         try:
+            self._validate_tool_arguments(request)
             check_multiple_response(request.n, self.llm.args.backend)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
@@ -973,6 +1011,120 @@ class OpenAIServer:
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
+                                # ... should we be setting our custom `Logger` instance(s) to use
+                                # this as well?
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
+
+    def _validate_tool_arguments(self, request: ChatCompletionRequest) -> None:
+        tool_parser = self._tool_call_parser_name
+        if (
+            request.tool_choice == "auto"
+            and not (self._enable_auto_tool_choice and tool_parser is not None)
+            and not self.use_harmony
+        ):
+            return self.create_error_response(
+                '"auto" tool choice requires '
+                "enable_auto_tool_choice and tool_call_parser to be set"
+            )
+
+    def _get_tool_call_info(self, model_output: str, request: ChatCompletionRequest):
+        tool_parser = self._tool_call_parser_cls(self.tokenizer.tokenizer)
+
+        tool_call_info = tool_parser.extract_tool_calls(
+            model_output=model_output, request=request
+        )
+
+        return tool_call_info
+
+    def _process_choices_for_tool_calls(
+        self,
+        role: str,
+        request: ChatCompletionRequest,
+        request_output: RequestOutput,
+    ) -> List[ChatCompletionResponseChoice]:
+        choices = []
+        # TODO: find out if interpreting each element in `request_output.outputs` as the basis for
+        # a `ChatCompletionResponseChoice` is correct.
+        for output in request_output.outputs:
+            # TODO: handle other cases as in vLLM.
+            content = output.text
+            auto_tools_called = False
+            if (
+                request.tools
+                and (request.tool_choice == "auto" or request.tool_choice is None)
+                and self._enable_auto_tool_choice
+                and self._tool_call_parser_name
+            ):
+                tool_call_info = self._get_tool_call_info(
+                    model_output=content, request=request
+                )
+                # In the OpenAI API the finish_reason is "tools_called"
+                # if the tool choice is auto and the model produced a tool
+                # call. The same is not true for named function calls
+                auto_tools_called = tool_call_info.tools_called
+                if tool_call_info.tools_called:
+                    message = ChatMessage(
+                        role=role,
+                        # TODO
+                        # reasoning_content=reasoning_content,
+                        content=tool_call_info.content,
+                        tool_calls=tool_call_info.tool_calls,
+                    )
+
+                else:
+                    # FOR NOW make it a chat message; we will have to detect
+                    # the type to make it later.
+                    ret_content = content
+
+                    # try to use content return from tool parser first,
+                    # tool parser may do some modify for the content.
+                    if tool_call_info.content and len(tool_call_info.content) > 0:
+                        ret_content = tool_call_info.content
+                    message = ChatMessage(
+                        role=role,
+                        # TODO
+                        # reasoning_content=reasoning_content,
+                        content=ret_content,
+                    )
+            else:
+                message = ChatMessage(
+                    role=role,
+                    # reasoning_content=reasoning_content,
+                    content=content,
+                )
+
+            choice_data = ChatCompletionResponseChoice(
+                index=output.index,
+                message=message,
+                finish_reason="tool_calls"
+                if auto_tools_called
+                else output.finish_reason
+                if output.finish_reason
+                else "stop",
+                stop_reason=output.stop_reason,
+            )
+            choices.append(choice_data)
+
+        return choices
+
+
+async def _log_request_error(request: Request, exc: Exception, error_title: str):
+    # Helper method to log request errors with full context.
+    column_width = 80
+    logger.error("=" * column_width)
+    logger.error(error_title)
+    logger.error("=" * column_width)
+    logger.error(f"URL: {request.url}")
+    logger.error(f"Method: {request.method}")
+    logger.error(f"Client: {request.client}")
+    # TODO: should these be included? What if they include credentials?
+    logger.error(f"Headers: {dict(request.headers)}")
+    try:
+        body = await request.body()
+        logger.error(f"Request Body: {body.decode('utf-8')}")
+    except Exception as e:
+        logger.error(f"Could not decode request body: {e}")
+    logger.error(traceback.format_exc())
+    logger.error("=" * column_width)
