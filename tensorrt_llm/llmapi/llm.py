@@ -45,6 +45,10 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+# Uncomment and replace in `generate_async` to experiment with different implementations.
+# from .pool_input_processor import MpPoolInputProcessor
+# from .futures_input_processor import FuturesInputProcessor
+from .self_managed_input_processor import SelfManagedInputProcessor
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
@@ -494,11 +498,18 @@ class BaseLLM:
                 # In the future, we should refactor this to:
                 # 1. Extend support for more modalities and models
                 # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
-                input_processor_with_hash = create_input_processor_with_hash(
-                    self.input_processor)
-                with nvtx_range_debug("input_processor_with_hash"):
-                    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
-                        inputs, sampling_params)
+                if hasattr(self, '_parallel_input_processor'
+                           ) and self._parallel_input_processor is not None:
+                    # Use parallel input processing for CPU-bound tokenization/multimodal processing
+                    with nvtx_range_debug("parallel_input_processor"):
+                        prompt_token_ids, extra_processed_inputs = self._parallel_input_processor.process(
+                            inputs, sampling_params, use_hash=True)
+                else:
+                    input_processor_with_hash = create_input_processor_with_hash(
+                        self.input_processor)
+                    with nvtx_range_debug("input_processor_with_hash"):
+                        prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
+                            inputs, sampling_params)
             elif 'multi_modal_embeddings' in inputs:
                 mm_embedding_info = inputs['multi_modal_embeddings']
                 prompt_token_ids, extra_processed_inputs = cast(
@@ -506,9 +517,16 @@ class BaseLLM:
                     self.input_processor).attach_multimodal_embeddings(
                         inputs, mm_embedding_info, sampling_params)
             else:
-                with nvtx_range_debug("input_processor"):
-                    prompt_token_ids, extra_processed_inputs = self.input_processor(
-                        inputs, sampling_params)
+                if hasattr(self, '_parallel_input_processor'
+                           ) and self._parallel_input_processor is not None:
+                    # Use parallel input processing for CPU-bound tokenization
+                    with nvtx_range_debug("parallel_input_processor"):
+                        prompt_token_ids, extra_processed_inputs = self._parallel_input_processor.process(
+                            inputs, sampling_params, use_hash=False)
+                else:
+                    with nvtx_range_debug("input_processor"):
+                        prompt_token_ids, extra_processed_inputs = self.input_processor(
+                            inputs, sampling_params)
             prompt = inputs['prompt']
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
@@ -842,6 +860,11 @@ class BaseLLM:
 
     @set_api_status("beta")
     def shutdown(self) -> None:
+        if hasattr(self, "_parallel_input_processor"
+                   ) and self._parallel_input_processor is not None:
+            self._parallel_input_processor.shutdown()
+            self._parallel_input_processor = None
+
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
@@ -958,6 +981,19 @@ class _TrtLLM(BaseLLM):
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
         self._tokenizer = self.input_processor.tokenizer
+
+        # Initialize parallel input processor if enabled
+        if self.args.num_input_workers > 0:
+            self._parallel_input_processor = SelfManagedInputProcessor(
+                num_workers=self.args.num_input_workers,
+                model_path=str(self._hf_model_dir),
+                tokenizer_dir=None,  # Uses model_path
+                checkpoint_format="HF",
+                trust_remote_code=self.args.trust_remote_code,
+                tokenizer_mode=self.args.tokenizer_mode,
+            )
+        else:
+            self._parallel_input_processor = None
 
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens
@@ -1154,6 +1190,19 @@ class _TorchLLM(BaseLLM):
                                                       self.tokenizer,
                                                       checkpoint_format)
         self._tokenizer = self.input_processor.tokenizer
+
+        # Initialize parallel input processor if enabled
+        if self.args.num_input_workers > 0:
+            self._parallel_input_processor = SelfManagedInputProcessor(
+                num_workers=self.args.num_input_workers,
+                model_path=str(self._hf_model_dir),
+                tokenizer_dir=None,  # Uses model_path
+                checkpoint_format=checkpoint_format,
+                trust_remote_code=self.args.trust_remote_code,
+                tokenizer_mode=self.args.tokenizer_mode,
+            )
+        else:
+            self._parallel_input_processor = None
 
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits

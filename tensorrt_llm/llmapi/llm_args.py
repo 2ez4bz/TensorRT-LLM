@@ -2158,6 +2158,13 @@ class BaseLlmArgs(StrictBaseModel):
         "The number of processes used for postprocessing the generated tokens, including detokenization.",
         status="prototype")
 
+    num_input_workers: int = Field(
+        default=0,
+        description=
+        "The number of processes used for preprocessing inputs (tokenization, multimodal processing). "
+        "Set to 0 to disable parallel input processing.",
+        status="prototype")
+
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
         description="The path to the tokenizer directory for postprocessing.",
