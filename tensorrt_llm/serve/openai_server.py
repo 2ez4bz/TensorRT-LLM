@@ -27,7 +27,9 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
-from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalServerConfig)
+from tensorrt_llm.inputs.registry import create_input_processor_with_hash
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, tracing
@@ -222,6 +224,50 @@ class OpenAIServer:
     @property
     def postproc_worker_enabled(self) -> bool:
         return True if self.llm.args.num_postprocess_workers > 0 else False
+
+    def _preprocess_chat_inputs(self, prompt, sampling_params):
+        """Run input processing (CPU-bound). Intended to be called via asyncio.to_thread."""
+        llm = self.llm
+        if 'multi_modal_data' in prompt:
+            if hasattr(llm, '_parallel_input_processor'
+                       ) and llm._parallel_input_processor is not None:
+                prompt_token_ids, extra = llm._parallel_input_processor.process(
+                    prompt, sampling_params, use_hash=True)
+            else:
+                proc = create_input_processor_with_hash(llm.input_processor)
+                prompt_token_ids, extra = proc(prompt, sampling_params)
+        elif 'multi_modal_embeddings' in prompt:
+            from tensorrt_llm.inputs.multimodal import \
+                BaseMultimodalInputProcessor
+            mm_embedding_info = prompt['multi_modal_embeddings']
+            prompt_token_ids, extra = BaseMultimodalInputProcessor.attach_multimodal_embeddings(
+                llm.input_processor, prompt, mm_embedding_info,
+                sampling_params)
+        else:
+            if hasattr(llm, '_parallel_input_processor'
+                       ) and llm._parallel_input_processor is not None:
+                prompt_token_ids, extra = llm._parallel_input_processor.process(
+                    prompt, sampling_params, use_hash=False)
+            else:
+                prompt_token_ids, extra = llm.input_processor(
+                    prompt, sampling_params)
+
+        query_token_ids = None
+        multimodal_params = None
+        if extra is not None:
+            query_token_ids = extra.get('query_token_ids')
+            multimodal_params = MultimodalParams(
+                multimodal_input=extra.get('multimodal_input'),
+                multimodal_data=extra.get('multimodal_data'))
+            if not multimodal_params.has_content():
+                multimodal_params = None
+            else:
+                multimodal_params.to_handle("multimodal_data")
+
+        tokens_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+        if query_token_ids is not None:
+            tokens_prompt["query_token_ids"] = query_token_ids
+        return tokens_prompt, multimodal_params
 
     @staticmethod
     def create_error_response(
@@ -596,10 +642,17 @@ class OpenAIServer:
 
             trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
+            # Pre-process input in a thread to avoid blocking the event loop
+            mm_params = None
+            if prompt.get("prompt") is not None:
+                prompt, mm_params = await asyncio.to_thread(
+                    self._preprocess_chat_inputs, prompt, sampling_params)
+
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
+                _multimodal_params=mm_params,
                 streaming=request.stream,
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,

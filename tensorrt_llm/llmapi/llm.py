@@ -374,6 +374,7 @@ class BaseLLM:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         _postproc_params: Optional[PostprocParams] = None,
+        _multimodal_params=None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
     ) -> RequestOutput:
@@ -435,7 +436,7 @@ class BaseLLM:
                 sampling_params.add_special_tokens = False
 
         query_token_ids = None
-        multimodal_params = None
+        multimodal_params = _multimodal_params
 
         if is_mm_disagg:
             if not getattr(self.input_processor, "support_mm_disagg", False):
