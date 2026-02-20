@@ -72,7 +72,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         self.mlp1 = nn.Sequential(
             nn.RMSNorm(
                 self.vit_hidden_size * int(1 / self.downsample_ratio) ** 2,
-                eps=config.llm_config.rms_norm_eps,
+                eps=config.llm_config.layer_norm_epsilon,
                 dtype=config.torch_dtype,
             ),
             nn.Linear(
@@ -296,12 +296,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         self.patch_size = self.config.patch_size
         self.downsample_ratio = self.config.downsample_ratio
         self.spatial_merge_size = int(self.patch_size / self.downsample_ratio)
-        self.img_context_token_id = self.config.img_context_token_id
+        self.img_context_token = self.config.img_context_token
+        # Fix: config.json has img_context_token_id=20 (</img>) but <image> is
+        # actually token 18. Derive the correct id from the tokenizer.
+        self.img_context_token_id = self.tokenizer.encode(
+            self.img_context_token, add_special_tokens=False
+        )[0]
         self.num_image_token = int(
             (self.image_size // self.patch_size) ** 2 * (self.downsample_ratio**2)
         )
         self.video_pruning_ratio = VIDEO_PRUNING_RATIO
-        self.img_context_token = self.config.img_context_token
         self.video_context_token = self.config.video_context_token
         self.img_start_token = self.config.img_start_token
         self.img_end_token = self.config.img_end_token
@@ -735,7 +739,14 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         self.vocab_size = llm_model_config.pretrained_config.vocab_size
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
-        self.img_context_token_id = config.img_context_token_id
+        # Fix: config.json has img_context_token_id=20 (</img>) but <image> is
+        # actually token 18. Derive the correct id from the tokenizer.
+        _tokenizer = transformers.AutoTokenizer.from_pretrained(
+            config._name_or_path, trust_remote_code=True
+        )
+        self.img_context_token_id = _tokenizer.encode(
+            config.img_context_token, add_special_tokens=False
+        )[0]
         self.video_context_token_id = config.video_context_token_id
         self.post_config()
         self.is_loaded = True
