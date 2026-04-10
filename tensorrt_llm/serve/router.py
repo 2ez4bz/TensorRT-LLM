@@ -669,6 +669,7 @@ class KvCacheAwareRouter(Router):
                 ],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
+                return_dict=False,
             )
             # Set prompt_token_ids so the worker server skips re-tokenization
             request.prompt_token_ids = token_ids
