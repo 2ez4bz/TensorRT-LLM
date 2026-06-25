@@ -19,7 +19,8 @@
 import functools
 import math
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
+                    Union, cast)
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +62,28 @@ _PROCESSOR_OUTPUT_KEYS = frozenset({
     "second_per_grid_ts",
     "mm_token_type_ids",
 })
+
+
+def _get_cached_merged_typed_dict(schema, cache):
+    """Return a stable copy of ProcessorMixin's ephemeral merged TypedDict."""
+    if getattr(schema, "__name__", None) != "merged_typed_dict":
+        return schema
+
+    try:
+        cache_key = (getattr(schema, "__total__",
+                             True), tuple(schema.__annotations__.items()))
+        cached_schema = cache.get(cache_key)
+    except TypeError:
+        return schema
+
+    if cached_schema is None:
+        cached_schema = TypedDict(
+            "merged_typed_dict",
+            dict(schema.__annotations__),
+            total=getattr(schema, "__total__", True),
+        )
+        cache[cache_key] = cached_schema
+    return cached_schema
 
 
 @functools.lru_cache(maxsize=None)
@@ -107,6 +130,7 @@ def _install_processor_output_validation_filter():
             "No transformers module exposes validate_typed_dict; "
             "cannot patch processor output validation.")
     base_orig = binders[0].validate_typed_dict
+    merged_schema_cache = {}
 
     def _filtered_validate(schema, data):
         if isinstance(data, dict):
@@ -114,6 +138,13 @@ def _install_processor_output_validation_filter():
                 k: v
                 for k, v in data.items() if k not in _PROCESSOR_OUTPUT_KEYS
             }
+        # ``ProcessorMixin._merge_kwargs`` creates a fresh
+        # ``TypedDict("merged_typed_dict", ...)`` for image/video kwargs on
+        # every processor call. ``huggingface_hub`` caches strict dataclass
+        # validators by schema object, so the fresh type defeats that cache.
+        # Reuse an equivalent public TypedDict class and let the upstream
+        # validator handle the actual strict validation.
+        schema = _get_cached_merged_typed_dict(schema, merged_schema_cache)
         return base_orig(schema, data)
 
     for b in binders:
