@@ -317,10 +317,10 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
-@pytest.mark.skip_device_not_contain(["B200"])
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it"
+    NVFP4_MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
     EXTRA_EVALUATOR_KWARGS = {
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -336,14 +336,30 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
         enable_block_reuse=False,
         enable_partial_reuse=False,
         free_gpu_memory_fraction=0.6,
-        dtype="fp8",
     )
+    kv_cache_config_fp8 = kv_cache_config.model_copy(update={"dtype": "fp8"})
 
-    def test_nvfp4(self):
+    @pytest.mark.skip_device_not_contain(["H200"])
+    def test_bf16(self):
         with LLM(
             self.MODEL_PATH,
             max_batch_size=16,
             kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @pytest.mark.skip_device_not_contain(["B200"])
+    def test_nvfp4(self):
+        with LLM(
+            self.NVFP4_MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config_fp8,
             enable_chunked_prefill=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4

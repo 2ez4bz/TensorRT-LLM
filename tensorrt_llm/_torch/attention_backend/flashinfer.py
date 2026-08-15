@@ -211,7 +211,6 @@ class MLAPlanParams:
 @dataclass(kw_only=True)
 class FlashInferWrappers:
     is_planned: bool
-    workspace_buffer: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_wrapper: Optional[
         flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
     prefill_wrapper: Optional[
@@ -574,17 +573,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             pool_num_blocks)
         src = self._vswa_pool_indices_cache[pool_id][:n]
         self._paged_kv_indices[:n].copy_(src, non_blocking=True)
-        indptr_n = self.max_num_requests + 1 if self.is_cuda_graph else self.num_seqs + 1
-        self._paged_kv_indptr_all[:indptr_n].copy_(
-            self._vswa_pool_indptr_cache[pool_id][:indptr_n], non_blocking=True)
-        decode_n = self.max_num_requests + 1 if self.is_cuda_graph else self.num_generations + 1
-        self.paged_kv_indptr_decode[:decode_n].copy_(
-            self._vswa_pool_decode_indptr_cache[pool_id][:decode_n],
-            non_blocking=True)
-        prefill_n = self.max_num_requests + 1 if self.is_cuda_graph else self.num_contexts + 1
-        self.paged_kv_indptr_prefill[:prefill_n].copy_(
-            self._vswa_pool_prefill_indptr_cache[pool_id][:prefill_n],
-            non_blocking=True)
+        indptr_n = self.paged_kv_indptr.numel()
+        self.paged_kv_indptr.copy_(
+            self._vswa_pool_indptr_cache[pool_id][:indptr_n],
+            non_blocking=True,
+        )
         positions_n = self.max_num_tokens if self.is_cuda_graph else self.num_tokens
         self._positions[:positions_n].copy_(
             self._vswa_pool_positions_cache[pool_id][:positions_n],
@@ -592,11 +585,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_context_blocks = num_context_blocks
         self.num_generation_blocks = num_generation_blocks
         self._vswa_active_pool_id = pool_id
-        # Keep the host mirror in lockstep with the device buffer so decode
-        # plans build their block tables from the active pool's indices.
-        self._host_paged_kv_indices = self._host_pool_indices[pool_id]
-        self._host_paged_kv_indptr_decode = self._host_pool_decode_indptr[
-            pool_id]
 
     @property
     def paged_kv_last_page_len(self) -> torch.Tensor:
@@ -767,7 +755,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             for plan_params, wrappers in self._plan_params_to_wrappers.items():
                 self._build_decode_block_tables(plan_params, wrappers)
         else:
-            self._clean_cached_plans(defer_plan=False)
+            self._clean_cached_plans()
 
     def update_shared_kv_draft_lengths(
         self,
@@ -823,7 +811,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             for plan_params, wrappers in self._plan_params_to_wrappers.items():
                 self._build_decode_block_tables(plan_params, wrappers)
         elif not torch.cuda.is_current_stream_capturing():
-            self._clean_cached_plans(defer_plan=False)
+            self._clean_cached_plans()
 
     def _update_draft_kv_lengths(self) -> None:
         """Publish runtime KV lengths to a shared or separate draft view."""
@@ -1372,15 +1360,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         wrappers.decode_block_table_active_width = max_n
         return block_tables[:num_gens]
 
-    def _clean_cached_plans(self, *, defer_plan: bool):
+    def _clean_cached_plans(self):
         for plan_params in list(self._plan_params_to_wrappers.keys()):
             # Generally, plan_params with non-trivial attention masking are relevant only the
             # corresponding forward pass. So, flush them out here as they won't be relevant for
             # subsequent forward calls.
             if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
                 self._plan_params_to_wrappers[plan_params].is_planned = False
-                if not defer_plan:
-                    self._plan_with_params(plan_params)
+                self._plan_with_params(plan_params)
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
@@ -1446,7 +1433,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             n = self.num_seqs
             self._cached_token_lens[:n].zero_()
             self.num_ctx_cached_tokens = 0
-            self._clean_cached_plans(defer_plan=False)
+            self._clean_cached_plans()
             return
 
         if self._multi_item_params is not None:
@@ -1650,11 +1637,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         pool_positions, non_blocking=True)
                     self._vswa_pool_positions_cache[pool_id] = positions_buf
 
-        # Each plan owns its workspace, so all cached wrappers can be replanned
-        # here when request turnover changes their page tables. Planning cannot
-        # be deferred to a CUDA-graph replay.
+        # Replan cached wrappers here when request turnover changes their page
+        # tables. The wrappers retain independent plan state and pool-specific
+        # buffers; their scratch workspace can be shared because they run
+        # sequentially. Planning cannot be deferred to a CUDA-graph replay.
         if not (self._is_separate_kv_draft_view and self.is_cuda_graph):
-            self._clean_cached_plans(defer_plan=False)
+            self._clean_cached_plans()
 
         # Re-plan MLA wrappers outside of forward/capture using the params
         # cached by prior warmup forwards. Forward still handles first-use or
@@ -1692,39 +1680,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 and self._mla_decode_wrapper is not None):
             self._do_plan_mla_decode(self._mla_decode_plan_params)
             self._mla_decode_planned = True
-
-        # VSWA: restore primary pool indices as the default.
-        if (self._vswa_layer_to_pool is not None
-                and self._vswa_pool_indices_cache is not None):
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
-            primary_num_blocks = self._vswa_pool_num_blocks[primary_pool_id]
-            self.num_context_blocks = sum(
-                primary_num_blocks[:self.num_contexts])
-            self.num_generation_blocks = sum(
-                primary_num_blocks[self.num_contexts:])
-            total_blocks = sum(primary_num_blocks)
-            src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
-            self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
-            self._paged_kv_indptr_all[:self.num_seqs + 1].copy_(
-                self._vswa_pool_indptr_cache[primary_pool_id][:self.num_seqs +
-                                                              1],
-                non_blocking=True,
-            )
-            self.paged_kv_indptr_decode[:self.num_generations + 1].copy_(
-                self._vswa_pool_decode_indptr_cache[primary_pool_id]
-                [:self.num_generations + 1],
-                non_blocking=True,
-            )
-            self.paged_kv_indptr_prefill[:self.num_contexts + 1].copy_(
-                self._vswa_pool_prefill_indptr_cache[primary_pool_id]
-                [:self.num_contexts + 1],
-                non_blocking=True,
-            )
-            self._vswa_active_pool_id = primary_pool_id
-            self._host_paged_kv_indices = \
-                self._host_pool_indices[primary_pool_id]
-            self._host_paged_kv_indptr_decode = self._host_pool_decode_indptr[
-                primary_pool_id]
 
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
@@ -1933,13 +1888,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # device buffer address must survive replans for CUDA graphs.
         wrappers = self._plan_params_to_wrappers.get(plan_params)
         if wrappers is None:
-            workspace_buffer = (self.workspace_buffer
-                                if not self._plan_params_to_wrappers else
-                                torch.empty_like(self.workspace_buffer))
-            wrappers = FlashInferWrappers(
-                is_planned=False,
-                workspace_buffer=workspace_buffer,
-            )
+            wrappers = FlashInferWrappers(is_planned=False)
             self._plan_params_to_wrappers[plan_params] = wrappers
 
         pool_id = plan_params.kv_pool_id
@@ -1959,7 +1908,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if wrappers.prefill_wrapper is None:
             wrappers.prefill_wrapper = \
                 flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    wrappers.workspace_buffer,
+                    self.workspace_buffer,
                     self.kv_layout,
                     backend=flashinfer_backend,
                     qo_indptr_buf=self.qo_indptr,
@@ -2008,7 +1957,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
             wrappers.decode_wrapper = \
                 flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                    wrappers.workspace_buffer,
+                    self.workspace_buffer,
                     self.kv_layout,
                     use_cuda_graph=self.is_cuda_graph,
                     paged_kv_indptr_buffer=paged_kv_indptr_decode_buffer,
