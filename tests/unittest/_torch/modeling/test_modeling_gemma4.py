@@ -876,6 +876,7 @@ def _build_gemma4_kv_cache_manager(
     num_blocks=4,
     tokens_per_block=32,
     batch_size=1,
+    evict_swa=False,
 ):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
@@ -936,7 +937,10 @@ def _build_gemma4_kv_cache_manager(
         needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
     if needs_vswa and sliding_window:
         max_attn_window = [
-            max_seq_len - 1 if lt == "sliding_attention" else max_seq_len for lt in layer_types
+            (sliding_window if evict_swa else max_seq_len - 1)
+            if lt == "sliding_attention"
+            else max_seq_len
+            for lt in layer_types
         ]
 
     kv_cache_config = KvCacheConfigV2(
@@ -3348,7 +3352,16 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
-    def _run_cuda_graph_real_headdim(self, config_dict, label=""):
+    def _run_cuda_graph_real_headdim(
+        self,
+        config_dict,
+        label="",
+        *,
+        evict_swa=False,
+        initial_cached=None,
+        replay_cached=None,
+        layer_indices=None,
+    ):
         """Helper: CUDA graph decode test with real head_dim configs."""
         from tensorrt_llm._torch.attention_backend import (
             FlashInferAttention,
@@ -3359,29 +3372,38 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         config = Gemma4TextConfig(**config_dict)
         batch_size = 2
         kv_cache_manager = self._get_kv_cache_manager(
-            config, num_blocks=16, tokens_per_block=32, batch_size=batch_size
+            config,
+            num_blocks=32 if evict_swa else 16,
+            tokens_per_block=32,
+            batch_size=batch_size,
+            evict_swa=evict_swa,
         )
 
         self.assertTrue(kv_cache_manager.is_vswa, f"{label}: Expected VSWA manager")
 
         request_ids = list(range(batch_size))
-        initial_cached = [30, 45]
+        initial_cached = initial_cached or [30, 45]
         token_nums = [t + 1 for t in initial_cached]
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-
-        for i in range(config.num_hidden_layers):
-            buf = kv_cache_manager.get_buffers(i)
-            if buf is not None:
-                torch.nn.init.normal_(buf)
+        requests = kv_cache_manager.add_dummy_requests(request_ids, token_nums, is_gen=evict_swa)
+        self.assertIsNotNone(requests)
 
         layer_types = config.layer_types
-        num_layers = config.num_hidden_layers
+        layer_indices = layer_indices or list(range(config.num_hidden_layers))
+        for layer_idx in layer_indices:
+            buf = kv_cache_manager.get_buffers(layer_idx)
+            if buf is not None:
+                if evict_swa:
+                    buf.zero_()
+                else:
+                    torch.nn.init.normal_(buf)
+
+        num_layers = len(layer_indices)
         dtype = config.torch_dtype
         device = torch.device("cuda")
         attention_k_eq_v = getattr(config, "attention_k_eq_v", False)
 
         layers_info = []
-        for layer_idx in range(num_layers):
+        for layer_idx in layer_indices:
             is_sliding = layer_types[layer_idx] == "sliding_attention"
             hd = (
                 config.head_dim
@@ -3482,6 +3504,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             for i in range(num_layers):
                 cg_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
         graph.replay()
+        torch.cuda.synchronize()
 
         for i in range(num_layers):
             torch.testing.assert_close(
@@ -3490,12 +3513,50 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 atol=1e-2,
                 rtol=0,
                 msg=(
-                    f"{label} Layer {i} ({layer_types[i]}, "
+                    f"{label} Layer {i} ({layer_types[layers_info[i]['layer_idx']]}, "
                     f"hd={layers_info[i]['head_dim']}, "
                     f"kv={layers_info[i]['num_kv_heads']}): "
                     f"CUDA graph diverges from eager"
                 ),
             )
+
+        if replay_cached is not None:
+            for request in requests:
+                kv_cache_manager.free_resources(request)
+            replay_token_nums = [t + 1 for t in replay_cached]
+            replay_requests = kv_cache_manager.add_dummy_requests(
+                request_ids, replay_token_nums, is_gen=True
+            )
+            self.assertIsNotNone(replay_requests)
+            cg_metadata.kv_cache_params = KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=replay_cached,
+            )
+            cg_metadata.prepare()
+            graph.replay()
+            torch.cuda.synchronize()
+            replay_ref_metadata = FlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=replay_cached,
+                ),
+                max_num_requests=batch_size,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
+            replay_ref_metadata.prepare()
+            for i in range(num_layers):
+                replay_ref = layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], replay_ref_metadata)
+                torch.testing.assert_close(
+                    cg_results[i],
+                    replay_ref,
+                    atol=1e-2,
+                    rtol=0,
+                    msg=f"{label} Layer {i}: graph diverges after request turnover",
+                )
 
         kv_cache_manager.shutdown()
 
@@ -3514,6 +3575,21 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     def test_cuda_graph_decode_31b_like(self):
         """31B-like: mixed GQA (2 sliding, 8 full K=V), hd=256/512."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG), "31B")
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_31b_like_with_swa_eviction(self):
+        """FA2 graphs compact evicted SWA pages and replay shorter KV lengths."""
+        self._run_cuda_graph_real_headdim(
+            deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG),
+            "31B eviction",
+            evict_swa=True,
+            initial_cached=[190, 221],
+            replay_cached=[30, 45],
+            layer_indices=[0, 5],
+        )
 
     @torch.no_grad()
     @unittest.mock.patch(
