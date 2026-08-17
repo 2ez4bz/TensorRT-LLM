@@ -45,8 +45,9 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_sm_100f, prefer_pinned
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
@@ -1646,16 +1647,12 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertEqual(len(full_pools), 1, "Full layers should share one pool")
         self.assertNotEqual(sliding_pools, full_pools, "Sliding and full pools must be different")
 
-        # After prepare(), per-pool indices cache must exist
+        # prepare() refreshes one coherent page table per pool.
         with torch.inference_mode():
             metadata.prepare()
 
-        self.assertIsNotNone(
-            metadata._vswa_pool_indices_cache,
-            "Per-pool indices cache not populated after prepare()",
-        )
         self.assertEqual(
-            len(metadata._vswa_pool_indices_cache), 2, "Expected 2 pool entries (sliding + full)"
+            len(metadata._vswa_pool_tables), 2, "Expected 2 pool entries (sliding + full)"
         )
 
         # Each pool's indices are fetched via different layer_id → pool_id
@@ -1948,6 +1945,26 @@ class TestGemma4HFComparison(unittest.TestCase):
     # during real-model validation. Each test is designed to FAIL if the
     # corresponding fix is reverted.
 
+    def test_vswa_compaction_preserves_pinned_host_memory(self):
+        """Eviction compaction keeps asynchronous H2D staging available."""
+        source = torch.tensor(
+            [BAD_PAGE_INDEX, 1, 2, 3, 4],
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+
+        no_eviction_source = source[1:]
+        unchanged, unchanged_counts = FlashInferAttentionMetadata._compact_evicted_pages(
+            no_eviction_source, [2, 2]
+        )
+        self.assertIs(unchanged, no_eviction_source)
+        self.assertEqual(unchanged_counts, [2, 2])
+
+        compact, compact_counts = FlashInferAttentionMetadata._compact_evicted_pages(source, [3, 2])
+        self.assertEqual(compact.tolist(), [1, 2, 3, 4])
+        self.assertEqual(compact_counts, [2, 2])
+        self.assertEqual(compact.is_pinned(), prefer_pinned())
+
     @torch.no_grad()
     def test_vswa_pool_cache_not_aliased(self):
         """VSWA: primary pool indices cache must be a separate buffer.
@@ -1990,7 +2007,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         # The primary pool cache buffer must NOT be the same object as
         # _paged_kv_indices — that's the aliasing bug.
         self.assertIsNot(
-            metadata._vswa_pool_indices_cache[primary_pool_id],
+            metadata._vswa_pool_tables[primary_pool_id].indices,
             metadata._paged_kv_indices,
             "Primary pool cache is aliased to _paged_kv_indices! "
             "Pool swaps will corrupt the primary pool's cached indices.",
@@ -1999,7 +2016,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         # Record the original primary pool indices
         total_blocks = metadata.num_generation_blocks + metadata.num_context_blocks
         pool0_original = (
-            metadata._vswa_pool_indices_cache[primary_pool_id][:total_blocks].cpu().clone()
+            metadata._vswa_pool_tables[primary_pool_id].indices[:total_blocks].cpu().clone()
         )
 
         # Find a full-attention (secondary pool) layer
@@ -2019,7 +2036,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         metadata.swap_paged_kv_indices_for_layer(sliding_layer)
 
         # After round-trip swap, primary pool cache must still have original values
-        pool0_after = metadata._vswa_pool_indices_cache[primary_pool_id][:total_blocks].cpu()
+        pool0_after = metadata._vswa_pool_tables[primary_pool_id].indices[:total_blocks].cpu()
         self.assertTrue(
             torch.equal(pool0_original, pool0_after),
             f"Primary pool indices corrupted after pool swap round-trip: "
@@ -2617,9 +2634,11 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         width: int,
     ) -> torch.Tensor:
         """Build the expected compact table from one VSWA pool's host indices."""
-        pool_indices = metadata._host_pool_indices[pool_id].numpy()
+        pool = metadata._vswa_pool_tables[pool_id]
+        self.assertIsNotNone(pool.host_indices)
+        pool_indices = pool.host_indices.numpy()
         expected = torch.zeros((rows, width), dtype=torch.int32)
-        source_offset = metadata.num_context_blocks
+        source_offset = pool.num_context_blocks
         for row, page_count in enumerate(page_counts):
             copy_width = min(page_count, width)
             expected[row, :copy_width] = torch.from_numpy(
@@ -2650,6 +2669,17 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             num_contexts=0,
         )
         expected_kv_lens = metadata._cached_token_lens[:2] + accepted_tokens
+
+        for pool_id, target_pool in metadata._vswa_pool_tables.items():
+            draft_pool = draft_metadata._vswa_pool_tables[pool_id]
+            self.assertNotEqual(draft_pool.indices.data_ptr(), target_pool.indices.data_ptr())
+            self.assertEqual(draft_pool.num_blocks, target_pool.num_blocks)
+            torch.testing.assert_close(
+                draft_pool.indptr[:3],
+                target_pool.indptr[:3],
+                atol=0,
+                rtol=0,
+            )
 
         for layer, query in zip(layers, queries, strict=True):
             layer.forward(query, None, None, draft_metadata)
@@ -3392,10 +3422,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         for layer_idx in layer_indices:
             buf = kv_cache_manager.get_buffers(layer_idx)
             if buf is not None:
-                if evict_swa:
-                    buf.zero_()
-                else:
-                    torch.nn.init.normal_(buf)
+                torch.nn.init.normal_(buf)
 
         num_layers = len(layer_indices)
         dtype = config.torch_dtype
@@ -3582,14 +3609,16 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     )
     def test_cuda_graph_decode_31b_like_with_swa_eviction(self):
         """FA2 graphs compact evicted SWA pages and replay shorter KV lengths."""
-        self._run_cuda_graph_real_headdim(
-            deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG),
-            "31B eviction",
-            evict_swa=True,
-            initial_cached=[190, 221],
-            replay_cached=[30, 45],
-            layer_indices=[0, 5],
-        )
+        for layer_indices in ([0, 5], [5, 0]):
+            with self.subTest(layer_indices=layer_indices):
+                self._run_cuda_graph_real_headdim(
+                    deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG),
+                    "31B eviction",
+                    evict_swa=True,
+                    initial_cached=[190, 221],
+                    replay_cached=[30, 45],
+                    layer_indices=layer_indices,
+                )
 
     @torch.no_grad()
     @unittest.mock.patch(
