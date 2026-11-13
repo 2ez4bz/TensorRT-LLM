@@ -1300,7 +1300,7 @@ def eligible(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> b
         return False
     if not (q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16):
         return False
-    if torch.cuda.get_device_capability(q.device) != (10, 3):
+    if torch.cuda.get_device_capability(q.device) not in ((10, 3), (10, 7)):
         return False
     if (
         q.stride(2) != 1

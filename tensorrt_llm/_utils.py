@@ -781,7 +781,7 @@ def is_flashinfer_gdn_decode_supported_arch(sm_version=None):
     """
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version in (90, 100, 103)
+    return sm_version in (90, 100, 103, 107)
 
 
 def print_all_stacks():

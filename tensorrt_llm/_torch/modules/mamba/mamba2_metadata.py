@@ -33,7 +33,7 @@ REPLAY_WORK_CACHE_SLOT = 1
 REPLAY_WORK_PNAT = 2
 REPLAY_WORK_CACHE_BUF_IDX = 3
 REPLAY_WORK_ITEM_WIDTH = 4
-_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 256
+_FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE = 512
 
 
 # Neither the decode count nor the alignment of the decode slice (it starts
@@ -93,6 +93,10 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
     """
     num_decodes = state_indices.shape[0]
     assert num_decodes <= _FUSED_GDN_REPLAY_WORK_ITEMS_MAX_BATCH_SIZE
+    if num_decodes > 256:
+        from tensorrt_llm.logger import logger
+        logger.info_once('EXPERIMENT metadata512 GDN partition active',
+                         key='experiment_gdn_partition512')
     _prepare_gdn_replay_work_items_kernel[(1, )](
         state_indices,
         prev_num_accepted_tokens,

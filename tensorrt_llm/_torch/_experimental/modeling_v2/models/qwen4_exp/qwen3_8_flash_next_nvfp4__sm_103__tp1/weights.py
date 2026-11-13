@@ -307,8 +307,29 @@ def _fc1_perm(rows: int, device, core) -> torch.Tensor:
     32-row block shuffle, composed into one gather. CuteDSL: the 64-row group
     interleave alone."""
     if core.trunk_moe_backend == "CUTEDSL":
+        if _on_rubin():
+            # bridging_gaps mv2_moe107: the Rubin (SM107) CuTe DSL FC1 kernels read [gate16, up16]
+            # row groups (built-in `interleave_gate_and_linear(group_size=16)`), not Blackwell's
+            # [up64, gate64]. Scales take the same row gather, then the same 128x4 swizzle.
+            return _gate_first_group_perm(rows, _RUBIN_GATE_UP_GROUP, device)
         return _group_interleave_perm(rows, _CUTEDSL_GATE_UP_GROUP, device)
     return _interleave_perm(rows, device)[_block32_perm(rows, device)]
+
+
+#: The Rubin FC1 epilogue's gate/up pairing group (gate rows first).
+_RUBIN_GATE_UP_GROUP = 16
+
+
+def _on_rubin() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
+
+
+def _gate_first_group_perm(rows: int, group: int, device) -> torch.Tensor:
+    """Gather index that interleaves the `[up | gate]` halves of a `2*I` row stack in
+    `group`-row blocks, gate first: gate[0:g], up[0:g], gate[g:2g], up[g:2g], ..."""
+    assert rows % (2 * group) == 0, (rows, group)
+    idx = torch.arange(rows, device=device).view(2, rows // (2 * group), group)
+    return idx.flip(0).transpose(0, 1).reshape(-1)
 
 
 def _swizzle(x: torch.Tensor) -> torch.Tensor:

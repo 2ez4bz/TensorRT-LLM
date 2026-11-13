@@ -268,9 +268,16 @@ from .ops.ssm.pack_gdn_decode_qkv import pack_gdn_decode_qkv
 from .ops.vision.patch_embed_conv3d import patch_embed_conv3d
 from .ops.vision.pos_embed_interpolate import pos_embed_interpolate
 
+#: bridging_gaps mv2_moe107: SM107 runs the CuteDSL MoE through the Rubin runners (see `_cute_dsl_routed`).
+_ON_RUBIN = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
+
 # The GPU architecture this target is certified for; a direct instantiation could
 # bypass routing.
-_SM = (10, 3)
+_SM = (
+    tuple(torch.cuda.get_device_capability())
+    if torch.cuda.get_device_capability() in ((10, 3), (10, 7))
+    else (10, 3)
+)
 
 # QSA backend metadata buffers rebuilt by prepare(). Their absence means the engine
 # did not select the QSA metadata and the index plane would never be written.
@@ -297,6 +304,8 @@ _MAMBA_FIELDS = (
 # A context launch at or above this many rows takes `qsa_sparse_gqa_rowtile`;
 # measured on GB300 it loses at 543 rows and wins from 4096 rows up.
 _ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer size
+# bridging_gaps: FP8 pools: context rows through a bf16 scratch (exact e4m3->bf16) and the row-tile pass.
+_FP8_ROWTILE = os.environ.get("TRTLLM_MV2_FP8_ROWTILE", "0") == "1"
 # Over an NVFP4 pool, a step with more context rows than this reads its context requests'
 # pages dequantized into a bf16 scratch through `qsa_sparse_gqa_rowtile`. GB300, a layer:
 # 16384 context rows 1.36 ms there against 77-948 ms for the NVFP4 per-row kernel.
@@ -3021,6 +3030,29 @@ def _cute_dsl_routed(core, L, logits, xq, xsf, routed_out) -> torch.Tensor:
     `xq` / `xsf` (linear scales) with SwiGLU and the requantize to the layer's one FC2 input
     scale fused, FC2, and the routing-weighted unpermute in a fixed slot order, which
     writes every row of `routed_out` `[T, hidden]` and returns it."""
+    if _ON_RUBIN:
+        # bridging_gaps mv2_moe107: the Blackwell CuteDSL MoE ops refuse SM107. On Rubin every launch runs
+        # `fp4_moe_renorm_cute_dsl`'s Rubin path (moe_topk_sort, Rubin gather FC1 + SwiGLU + requant, Rubin
+        # FC2 + finalize scatter-add into `routed_out`) over this backend's one expert copy, whose FC1
+        # rows `weights.py` lays out as Rubin's [gate16, up16] groups. Same routing function; the
+        # weighted sum is an fp32 scatter-add instead of the fixed-order unpermute.
+        capturing = torch.cuda.is_current_stream_capturing()
+        return fp4_moe_renorm_cute_dsl(
+            logits,
+            xq,
+            xsf,
+            L.fc1_w,
+            L.fc1_s,
+            L.alpha1,
+            L.fc2_w,
+            L.fc2_s,
+            L.alpha2,
+            L.global_sf,
+            core.num_experts,
+            core.topk,
+            memset_stream=None if capturing else getattr(core, "_moe_memset_stream", None),
+            out=routed_out,
+        )
     # fp32 weights: the dtype the unpermute scales by.
     topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=torch.float32)
     # The sort pads each expert's (token, expert) pairs to whole tiles and emits the tile
@@ -3169,20 +3201,27 @@ def _sparse_gqa_nvfp4_context(
             f"the plan's groups end at row {groups[-1][1]}, not at the {num_ctx} context rows"
         )
         for first_row, end_row, slots, counts, offsets in groups:
-            qsa_nvfp4_pages_to_bf16(
-                kv.k,
-                kv.v,
-                kv.k_scale,
-                kv.v_scale,
-                core.kv_scale_quant_orig,
-                block_table,
-                slots,
-                counts,
-                offsets,
-                table,
-                k_scratch,
-                v_scratch,
-            )
+            if kv.k_scale is None:
+                from .ops.attention.qsa_fp8_pages_to_bf16 import qsa_fp8_pages_to_bf16
+
+                qsa_fp8_pages_to_bf16(
+                    kv.k, kv.v, block_table, slots, counts, offsets, table, k_scratch, v_scratch
+                )
+            else:
+                qsa_nvfp4_pages_to_bf16(
+                    kv.k,
+                    kv.v,
+                    kv.k_scale,
+                    kv.v_scale,
+                    core.kv_scale_quant_orig,
+                    block_table,
+                    slots,
+                    counts,
+                    offsets,
+                    table,
+                    k_scratch,
+                    v_scratch,
+                )
             context = qsa_sparse_gqa_rowtile(
                 q=q[first_row:end_row],
                 k_cache=k_scratch,
@@ -3817,7 +3856,9 @@ class PrefillTarget:
                             token_topk=core.token_topk,
                         )
                     )
-            if kv.k_scale is not None:
+            if kv.k_scale is not None or (
+                step.nvfp4_context is not None and kv.k.dtype == torch.float8_e4m3fn
+            ):
                 _sparse_gqa_nvfp4_context(
                     core,
                     kv,
@@ -4484,10 +4525,13 @@ class PrefillTarget:
             )
 
         nvfp4_context = None
-        if (
-            sparse
-            and core.quant_mode == QM_NVFP4_KV_CACHE
-            and num_prefill_tokens > _NVFP4_ROWTILE_MIN_ROWS
+        if sparse and (
+            (core.quant_mode == QM_NVFP4_KV_CACHE and num_prefill_tokens > _NVFP4_ROWTILE_MIN_ROWS)
+            or (
+                _FP8_ROWTILE
+                and core.quant_mode == QM_FP8_KV_CACHE
+                and num_prefill_tokens >= _ROWTILE_MIN_ROWS
+            )
         ):
             nvfp4_context = _nvfp4_context_plan(
                 core, md, qsa[0], md.qsa_block_table, md.tokens_per_block

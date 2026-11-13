@@ -261,6 +261,13 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
             )
             return
         if self.num_contexts == 0 and num_seqs <= QSA_GENERATION_MAPPING_MAX_SEQS:
+            if num_seqs > 256 and not getattr(self, "_experiment_metadata512_seen", False):
+                from tensorrt_llm.logger import logger
+
+                logger.info(
+                    f"EXPERIMENT metadata512 QSA fused mapping active: requests={num_seqs}, token_rows={num_tokens}"
+                )
+                self._experiment_metadata512_seen = True
             triton_qsa_generation_token_mapping(
                 kv_lens=self.kv_lens_cuda_runtime[:num_seqs],
                 seq_lens=seq_lens,

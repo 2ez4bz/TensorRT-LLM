@@ -187,7 +187,7 @@ def triton_qsa_decode_token_mapping(
 
 
 # Largest batch the generation token mapping holds in one tile of request lengths.
-QSA_GENERATION_MAPPING_MAX_SEQS = 256
+QSA_GENERATION_MAPPING_MAX_SEQS = 512
 
 
 @triton.jit(do_not_specialize=["num_seqs", "num_rows"])

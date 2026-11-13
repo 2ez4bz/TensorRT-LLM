@@ -195,7 +195,7 @@ def route(
 
     # Qwen3.8-Flash-Next-NVFP4 on one GB300 (sm103), MTP-Eagle or no speculation.
     if (
-        compute_capability == (10, 3)
+        compute_capability in ((10, 3), (10, 7))
         and shape == _TEXT_SHAPE
         and vshape == _VISION_SHAPE
         and mapping.world_size == 1

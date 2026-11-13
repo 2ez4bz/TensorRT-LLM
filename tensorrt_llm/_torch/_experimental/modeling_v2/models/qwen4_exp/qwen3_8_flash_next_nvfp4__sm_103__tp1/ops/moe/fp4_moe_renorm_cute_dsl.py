@@ -10,6 +10,8 @@ family's layout."""
 
 from __future__ import annotations
 
+import os as _os
+
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
@@ -72,6 +74,66 @@ class _Fc2HintRunner(_cdo.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRun
 
 _RUNNERS: dict = {}
 
+# --- bridging_gaps mv2_moe107: Rubin (SM107) path ------------------------------------------
+# The Blackwell runners above refuse SM107. On SM107 the same call runs TRT-LLM's Rubin CuTe DSL
+# MoE runners (gather FC1 + SwiGLU + NVFP4 requant, FC2 + finalize scatter-add) over the
+# `fc*_cd` copy, whose FC1 rows `weights.py` lays out as Rubin's [gate16, up16] groups there.
+# The Rubin kernels need the routing tile equal to the MMA tiler M, so the sort and memset run
+# at `_tile_tokens()`; tactics are pinned (measured on VR GR100 at 4K-64K rows).
+
+_RUBIN_TILE_ENV = "TRTLLM_MODELING_V2_MOE107_TILE"  # "auto" (default) | 128 | 256
+_RUBIN_TILE256_MIN_ROWS_ENV = "TRTLLM_MODELING_V2_MOE107_TILE256_MIN_ROWS"
+
+
+def _on_rubin() -> bool:
+    return torch.cuda.get_device_capability() == (10, 7)
+
+
+def _tile_tokens(tokens: int = 0) -> int:
+    """Routing tile (= the Rubin MMA tiler M). `auto`: 256 (2-CTA) from 32K rows, where it measured
+    1.31 vs 1.46 ms/layer at 65,536 rows; 128 below (0.47 vs 0.51 ms at 16,384 rows)."""
+    if not _on_rubin():
+        return TILE_TOKENS
+    mode = _os.environ.get(_RUBIN_TILE_ENV, "auto")
+    if mode != "auto":
+        return int(mode)
+    return 256 if tokens >= int(_os.environ.get(_RUBIN_TILE256_MIN_ROWS_ENV, "32768")) else 128
+
+
+#: Rubin tactics per routing tile, the fastest of each runner's valid tactics on VR GR100 (212 SMs) at
+#: 16,384 and 65,536 rows (512 experts, top-10, H 2560, I 640): FC1 `(mma_tiler, mma_inst_shape,
+#: cluster_mn, raster_along_m, a_path)`, FC2 `(mma_tiler, mma_inst_shape, cluster_mn, raster_along_m)`.
+RUBIN_TACTICS = {
+    128: (
+        ((128, 256, 256), (128, 256, 128), (1, 1), False, "cpasync"),
+        ((128, 256, 256), (128, 256, 128), (1, 1), False),
+    ),
+    256: (
+        ((256, 256, 256), (256, 256, 128), (2, 1), False, "cpasync"),
+        ((256, 256, 256), (256, 256, 128), (2, 1), False),
+    ),
+}
+
+
+def _rubin_runners(num_experts: int, top_k: int, tile: int) -> tuple:
+    key = ("sm107", num_experts, top_k, tile)
+    if key not in _RUNNERS:
+        fc1 = _cdo.Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+            num_experts,
+            top_k,
+            num_experts,
+            0,
+            tile,
+            16,
+            activation_type=ActivationType.Swiglu,
+            swiglu_limit_scalar=_SWIGLU_LIMIT,
+        )
+        fc2 = _cdo.Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+            num_experts, top_k, num_experts, 0, tile, torch.bfloat16, 16
+        )
+        _RUNNERS[key] = (fc1, fc2, fc2)
+    return _RUNNERS[key]
+
 
 def _runners(num_experts: int, top_k: int) -> tuple:
     """`(fc1, fc2, fc2 with L2 hints)` for a geometry, built once (they hold compiled kernels)."""
@@ -115,7 +177,7 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
     accumulator (the routed entry's `output2_scale_scalar`).
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -176,20 +238,35 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
         num_experts: int,
         top_k: int,
         memset_stream: torch.cuda.Stream | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tokens = hidden_states.shape[0]
         hidden = hidden_states.shape[1] * 2
-        fc1, fc2, fc2_hint = _runners(num_experts, top_k)
+        rubin = _on_rubin()
+        tile = _tile_tokens(tokens)
+        if rubin:
+            fc1, fc2, fc2_hint = _rubin_runners(num_experts, top_k, tile)
+            fc1_tactic, fc2_tactic = RUBIN_TACTICS.get(tile, (None, None))
+        else:
+            fc1, fc2, fc2_hint = _runners(num_experts, top_k)
+            fc1_tactic, fc2_tactic = FC1_TACTIC, FC2_TACTIC
         if tokens >= L2_HINT_MIN_ROWS:
             fc2 = fc2_hint
         # Renormalize routing and the tile sort in one launch: the same (expert, weight) pairs
         # (weights rounded to bf16 once) and slot order as `renorm_moe_routing_op` + `moe_sort`.
         t2e, t2lim, e2p, p2e, _, live, weights = torch.ops.trtllm.moe_topk_sort(
             routing_logits, None, num_experts, top_k, None, None, 0, num_experts, None,
-            TILE_TOKENS, 1,
+            tile, 1,
         )  # fmt: skip
         scales = weights.float()
-        out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
+        if out is None:
+            out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
+        else:
+            assert (
+                out.shape == (tokens, hidden)
+                and out.dtype == torch.bfloat16
+                and out.is_contiguous()
+            )
 
         def memset() -> None:
             torch.ops.trtllm.moe_output_memset_inplace(
@@ -198,7 +275,7 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
                 expanded_idx_to_permuted_idx=e2p,
                 permuted_idx_to_expanded_idx=p2e,
                 num_non_exiting_tiles=live,
-                tile_tokens_dim=TILE_TOKENS,
+                tile_tokens_dim=tile,
                 top_k=top_k,
                 ep_size=1,
                 enable_alltoall=False,
@@ -226,8 +303,9 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
                 p2e,
                 live,
                 fc2_input_scale,
-            ],
-            tactic=FC1_TACTIC,
+            ]
+            + ([None, None] if rubin else []),
+            tactic=fc1_tactic,
         )
         if memset_stream is not None:
             main.wait_stream(memset_stream)
@@ -247,7 +325,7 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
                 live,
                 scales,
             ],
-            tactic=FC2_TACTIC,
+            tactic=fc2_tactic,
         )
         return out
 
@@ -282,6 +360,7 @@ class Fp4MoeRenormCuteDsl(OpWrapper):
         num_experts: int,
         top_k: int,
         memset_stream: torch.cuda.Stream | None = None,
+        out: torch.Tensor | None = None,
     ) -> None:
         for name, tensor in (
             ("routing_logits", routing_logits),
