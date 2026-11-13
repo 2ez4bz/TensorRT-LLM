@@ -1527,142 +1527,21 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            token_idx = cutlass.Int32(0)
-            token_scale = self.final_scale_dtype(0.0)
+            # PATCH(qwen38-bg v2): B-reuse path only: routing-metadata prefetch + deferred bulk-reduce drain.
+            if cutlass.const_expr(self.enable_breuse):
+                token_idx = cutlass.Int32(0)
+                token_scale = self.final_scale_dtype(0.0)
 
-            # Get first tile info (5 elements)
-            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(5, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
-            is_valid_tile = tile_info[3] == 1
-            cute.arch.fence_proxy("async.shared", space="cta")
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
-            tile_info_consumer_state.advance()
+                # PATCH(qwen38-bg prefetch): per-row routing metadata (token index, alpha * token_scale) for up to
+                # 2 m-iterations (B-reuse) is loaded one tile AHEAD, so the dependent global loads
+                # (permuted_idx_to_expanded_idx -> token_final_scales, alpha[expert]) overlap the previous tile's
+                # bulk reductions instead of sitting on the epilogue critical path.
+                pre_tok = cute.make_rmem_tensor((2,), cutlass.Int32)
+                pre_alpha = cute.make_rmem_tensor((2,), cutlass.Float32)
+                cur_tok = cute.make_rmem_tensor((2,), cutlass.Int32)
 
-            while is_valid_tile:
-                mma_tile_coord_mnl = (
-                    tile_info[0] // cute.size(tiled_mma.thr_id.shape),
-                    tile_info[1],
-                    tile_info[2],
-                )
-
-                expert_idx = mma_tile_coord_mnl[2]
-                alpha_val = alpha[expert_idx]
-
-                # Compute base row index for this tile
-                tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
-
-                # Get accumulator stage index
-                acc_stage_index = acc_consumer_state.index
-
-                # Set tensor memory buffer for current tile
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
-
-                # Wait for accumulator buffer full
-                acc_pipeline.consumer_wait(acc_consumer_state)
-
-                tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-
-                # Group tRS_sC modes 1 and 2 (m_iter, n_subtile) into a single 2D mode
-                # Before: ((1,32), 2, 4, 1) -> After: ((1,32), (2,4), 1)
-                # This allows using tuple indexing like tTR_tAcc
-                tRS_sC_grouped = cute.group_modes(tRS_sC, 1, 3)
-
-                # Get m-iteration count and n-subtile count from tTR_tAcc shape
-                # In B-reuse (cta_tile_m=256): mode-3 is (2,4), m_iter_cnt=2, n_subtile_cnt=4
-                # In non-B-reuse (cta_tile_m=128): mode-3 is (1,4), m_iter_cnt=1, n_subtile_cnt=4
-                m_iter_cnt = cute.size(tTR_tAcc.shape[3], mode=[0])
-                n_subtile_cnt = cute.size(tTR_tAcc.shape[3], mode=[1])
-
-                # TODO:How could reduction be done with a better perf?
-                # Process all m-iterations and n-subtiles
-                for m_iter_idx in cutlass.range(m_iter_cnt):
-                    # Compute row indices for this m-iteration
-                    # Each thread handles row: tile_m_start + m_iter_idx * 128 + epi_tidx
-                    permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
-                    expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-                    is_valid_row = permuted_row < tile_info[4]
-
-                    # Compute token info and scaled alpha for this row
-                    token_idx = cutlass.Int32(0)
-                    alpha_val_iter = alpha_val
-                    if is_valid_row:
-                        token_idx = expanded_idx // self.topK
-                        topk_idx = expanded_idx % self.topK
-                        token_scale = token_final_scales[(token_idx, topk_idx)]
-                        alpha_val_iter = alpha_val * token_scale
-
-                    for n_iter_idx in cutlass.range(n_subtile_cnt):
-                        # Load accumulator from tensor memory buffer to register
-                        # Index with (m_iter_idx, subtile_idx) for the composite mode-3
-                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, (m_iter_idx, n_iter_idx))]
-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-
-                        # For block reduce: retile then load, compute, store
-                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        acc_vec_final = (alpha_val_iter * acc_vec).to(self.c_dtype)
-                        tRS_rC.store(acc_vec_final)
-                        if is_valid_row:
-                            # Use grouped tRS_sC with tuple indexing to preserve rank
-                            # tRS_sC_grouped: ((1,32), (2,4), 1)
-                            # Index: (None, (m_iter_idx, subtile_idx), None) -> ((1,32), 1, 1) rank 3
-                            cute.copy(
-                                tiled_copy_r2s,
-                                # TODO: check if there is a better way to index and make same rank
-                                tRS_rC[None, 0, 0],
-                                tRS_sC_grouped[(None, (m_iter_idx, n_iter_idx), 0)],
-                            )
-
-                        cute.arch.fence_proxy("async.shared", space="cta")
-
-                # Async arrive accumulator buffer empty
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
-                acc_consumer_state.advance()
-
-                # TODO:Currently finish all sts and do all reduce, do we have a better way for epilogue overlapping?
-                # Block reduce for all m-iterations
-                for m_iter_idx in cutlass.range(m_iter_cnt):
-                    permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
-                    is_valid_row = permuted_row < tile_info[4]
-
-                    if is_valid_row:
-                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-                        token_idx = expanded_idx // self.topK
-                        coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
-
-                        # sC row index: m_iter_idx * 128 + epi_tidx
-                        sC_row = m_iter_idx * 128 + epi_tidx
-
-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                self.epilog_sync_barrier.arrive_and_wait()
-                # ============================================================
-                # END OF NEW CODE
-                # ============================================================
-
-                # Get next tile (5 elements)
+                # Get first tile info (5 elements)
+                tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(5, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -1670,6 +1549,291 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+
+                # m-iteration count is a static layout property (1 without B-reuse, 2 with B-reuse)
+                tTR_tAcc_probe = tTR_tAcc_base[(None, None, None, None, None, 0)]
+                tTR_tAcc_probe = cute.group_modes(tTR_tAcc_probe, 3, cute.rank(tTR_tAcc_probe))
+                m_iter_cnt = cute.size(tTR_tAcc_probe.shape[3], mode=[0])
+                n_subtile_cnt = cute.size(tTR_tAcc_probe.shape[3], mode=[1])
+
+                if is_valid_tile:
+                    pre_alpha_e = alpha[tile_info[2]]
+                    for m_iter_idx in cutlass.range(m_iter_cnt, unroll_full=True):
+                        p_row = (
+                            tile_info[0] * self.cta_tile_shape_mnk[0] + m_iter_idx * 128 + epi_tidx
+                        )
+                        p_tok = cutlass.Int32(0)
+                        p_alpha = pre_alpha_e
+                        if p_row < tile_info[4]:
+                            p_exp = permuted_idx_to_expanded_idx[p_row]
+                            p_tok = p_exp // self.topK
+                            p_alpha = pre_alpha_e * token_final_scales[(p_tok, p_exp % self.topK)]
+                        pre_tok[m_iter_idx] = p_tok
+                        pre_alpha[m_iter_idx] = p_alpha
+
+                while is_valid_tile:
+                    mma_tile_coord_mnl = (
+                        tile_info[0] // cute.size(tiled_mma.thr_id.shape),
+                        tile_info[1],
+                        tile_info[2],
+                    )
+
+                    # Compute base row index for this tile
+                    tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
+                    cur_mn_limit = tile_info[4]
+                    coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
+
+                    # Get accumulator stage index
+                    acc_stage_index = acc_consumer_state.index
+
+                    # Set tensor memory buffer for current tile
+                    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
+
+                    # Wait for accumulator buffer full
+                    acc_pipeline.consumer_wait(acc_consumer_state)
+
+                    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+
+                    tRS_sC_grouped = cute.group_modes(tRS_sC, 1, 3)
+
+                    for m_iter_idx in cutlass.range_constexpr(m_iter_cnt):
+                        permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
+                        is_valid_row = permuted_row < cur_mn_limit
+                        alpha_val_iter = pre_alpha[m_iter_idx]
+                        cur_tok[m_iter_idx] = pre_tok[m_iter_idx]
+
+                        for n_iter_idx in cutlass.range_constexpr(n_subtile_cnt):
+                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, (m_iter_idx, n_iter_idx))]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                            acc_vec_final = (alpha_val_iter * acc_vec).to(self.c_dtype)
+                            tRS_rC.store(acc_vec_final)
+                            if m_iter_idx == 0 and n_iter_idx == 0:
+                                # PATCH v2: deferred drain - previous tile's bulk reductions finish reading sC while
+                                # this tile waited on its accumulator and loaded the first TMEM subtile.
+                                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                                self.epilog_sync_barrier.arrive_and_wait()
+                            if is_valid_row:
+                                cute.copy(
+                                    tiled_copy_r2s,
+                                    tRS_rC[None, 0, 0],
+                                    tRS_sC_grouped[(None, (m_iter_idx, n_iter_idx), 0)],
+                                )
+
+                            cute.arch.fence_proxy("async.shared", space="cta")
+
+                    # Async arrive accumulator buffer empty
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
+
+                    # PATCH: fetch next tile info and issue its metadata loads before this tile's reductions
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    for idx in cutlass.range(5, unroll_full=True):
+                        tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+                    if is_valid_tile:
+                        pre_alpha_e = alpha[tile_info[2]]
+                        for m_iter_idx in cutlass.range(m_iter_cnt, unroll_full=True):
+                            p_row = (
+                                tile_info[0] * self.cta_tile_shape_mnk[0]
+                                + m_iter_idx * 128
+                                + epi_tidx
+                            )
+                            p_tok = cutlass.Int32(0)
+                            p_alpha = pre_alpha_e
+                            if p_row < tile_info[4]:
+                                p_exp = permuted_idx_to_expanded_idx[p_row]
+                                p_tok = p_exp // self.topK
+                                p_alpha = (
+                                    pre_alpha_e * token_final_scales[(p_tok, p_exp % self.topK)]
+                                )
+                            pre_tok[m_iter_idx] = p_tok
+                            pre_alpha[m_iter_idx] = p_alpha
+
+                    # Block reduce for all m-iterations of the CURRENT tile
+                    for m_iter_idx in cutlass.range(m_iter_cnt, unroll_full=True):
+                        permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
+                        is_valid_row = permuted_row < cur_mn_limit
+
+                        if is_valid_row:
+                            scatter_out_offset = cute.domain_offset(
+                                (cur_tok[m_iter_idx], coord_n, 0), c
+                            )
+                            sC_row = m_iter_idx * 128 + epi_tidx
+
+                            if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+
+                    cute.arch.cp_async_bulk_commit_group()
+
+                # PATCH v2: drain the last tile's reductions before teardown
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                self.epilog_sync_barrier.arrive_and_wait()
+            else:
+                token_idx = cutlass.Int32(0)
+                token_scale = self.final_scale_dtype(0.0)
+
+                # Get first tile info (5 elements)
+                tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                for idx in cutlass.range(5, unroll_full=True):
+                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
+                cute.arch.fence_proxy("async.shared", space="cta")
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+
+                while is_valid_tile:
+                    mma_tile_coord_mnl = (
+                        tile_info[0] // cute.size(tiled_mma.thr_id.shape),
+                        tile_info[1],
+                        tile_info[2],
+                    )
+
+                    expert_idx = mma_tile_coord_mnl[2]
+                    alpha_val = alpha[expert_idx]
+
+                    # Compute base row index for this tile
+                    tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
+
+                    # Get accumulator stage index
+                    acc_stage_index = acc_consumer_state.index
+
+                    # Set tensor memory buffer for current tile
+                    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
+
+                    # Wait for accumulator buffer full
+                    acc_pipeline.consumer_wait(acc_consumer_state)
+
+                    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+
+                    # Group tRS_sC modes 1 and 2 (m_iter, n_subtile) into a single 2D mode
+                    # Before: ((1,32), 2, 4, 1) -> After: ((1,32), (2,4), 1)
+                    # This allows using tuple indexing like tTR_tAcc
+                    tRS_sC_grouped = cute.group_modes(tRS_sC, 1, 3)
+
+                    # Get m-iteration count and n-subtile count from tTR_tAcc shape
+                    # In B-reuse (cta_tile_m=256): mode-3 is (2,4), m_iter_cnt=2, n_subtile_cnt=4
+                    # In non-B-reuse (cta_tile_m=128): mode-3 is (1,4), m_iter_cnt=1, n_subtile_cnt=4
+                    m_iter_cnt = cute.size(tTR_tAcc.shape[3], mode=[0])
+                    n_subtile_cnt = cute.size(tTR_tAcc.shape[3], mode=[1])
+
+                    # TODO:How could reduction be done with a better perf?
+                    # Process all m-iterations and n-subtiles
+                    for m_iter_idx in cutlass.range(m_iter_cnt):
+                        # Compute row indices for this m-iteration
+                        # Each thread handles row: tile_m_start + m_iter_idx * 128 + epi_tidx
+                        permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
+                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                        is_valid_row = permuted_row < tile_info[4]
+
+                        # Compute token info and scaled alpha for this row
+                        token_idx = cutlass.Int32(0)
+                        alpha_val_iter = alpha_val
+                        if is_valid_row:
+                            token_idx = expanded_idx // self.topK
+                            topk_idx = expanded_idx % self.topK
+                            token_scale = token_final_scales[(token_idx, topk_idx)]
+                            alpha_val_iter = alpha_val * token_scale
+
+                        for n_iter_idx in cutlass.range(n_subtile_cnt):
+                            # Load accumulator from tensor memory buffer to register
+                            # Index with (m_iter_idx, subtile_idx) for the composite mode-3
+                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, (m_iter_idx, n_iter_idx))]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                            # For block reduce: retile then load, compute, store
+                            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                            acc_vec_final = (alpha_val_iter * acc_vec).to(self.c_dtype)
+                            tRS_rC.store(acc_vec_final)
+                            if is_valid_row:
+                                # Use grouped tRS_sC with tuple indexing to preserve rank
+                                # tRS_sC_grouped: ((1,32), (2,4), 1)
+                                # Index: (None, (m_iter_idx, subtile_idx), None) -> ((1,32), 1, 1) rank 3
+                                cute.copy(
+                                    tiled_copy_r2s,
+                                    # TODO: check if there is a better way to index and make same rank
+                                    tRS_rC[None, 0, 0],
+                                    tRS_sC_grouped[(None, (m_iter_idx, n_iter_idx), 0)],
+                                )
+
+                            cute.arch.fence_proxy("async.shared", space="cta")
+
+                    # Async arrive accumulator buffer empty
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
+
+                    # TODO:Currently finish all sts and do all reduce, do we have a better way for epilogue overlapping?
+                    # Block reduce for all m-iterations
+                    for m_iter_idx in cutlass.range(m_iter_cnt):
+                        permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
+                        is_valid_row = permuted_row < tile_info[4]
+
+                        if is_valid_row:
+                            expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                            token_idx = expanded_idx // self.topK
+                            coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
+                            scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
+
+                            # sC row index: m_iter_idx * 128 + epi_tidx
+                            sC_row = m_iter_idx * 128 + epi_tidx
+
+                            if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    # ============================================================
+                    # END OF NEW CODE
+                    # ============================================================
+
+                    # Get next tile (5 elements)
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    for idx in cutlass.range(5, unroll_full=True):
+                        tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
 
             # Dealloc tensor memory
             tmem.relinquish_alloc_permit()
